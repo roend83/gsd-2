@@ -17,7 +17,7 @@ Thumbs.db
 !.env.example
 node_modules/
 .next/
-/dist/
+# /dist/
 !/pkg/dist/modes/
 !/pkg/dist/core/export-html/
 build/
@@ -35,11 +35,11 @@ coverage/
 tmp/
 
 # ── Workspace packages ──
-packages/*/dist/
+# packages/*/dist/
 packages/*/node_modules/
 
 # ── GSD baseline (auto-generated) ──
-dist/
+# dist/
 !/pkg/dist/modes/
 !/pkg/dist/core/export-html/
 .bg_shell

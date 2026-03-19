@@ -1,0 +1,460 @@
+/**
+ * GSD Git Service
+ *
+ * Core git operations for GSD: types, constants, and pure helpers.
+ * Higher-level operations (commit, staging, branching) build on these.
+ *
+ * This module centralizes the GitPreferences interface, runtime exclusion
+ * paths, commit type inference, and the runGit shell helper.
+ */
+import { execFileSync, execSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { gsdRoot } from "./paths.js";
+import { GIT_NO_PROMPT_ENV } from "./git-constants.js";
+import { loadEffectiveGSDPreferences } from "./preferences.js";
+import { detectWorktreeName, SLICE_BRANCH_RE, } from "./worktree.js";
+import { nativeGetCurrentBranch, nativeDetectMainBranch, nativeBranchExists, nativeHasChanges, nativeAddAll, nativeResetPaths, nativeHasStagedChanges, nativeCommit, nativeRmCached, nativeUpdateRef, } from "./native-git-bridge.js";
+import { GSDError, GSD_MERGE_CONFLICT, GSD_GIT_ERROR } from "./errors.js";
+import { getErrorMessage } from "./error-utils.js";
+export const VALID_BRANCH_NAME = /^[a-zA-Z0-9_\-\/.]+$/;
+/**
+ * Build a meaningful conventional commit message from task execution context.
+ * Format: `{type}({sliceId}/{taskId}): {description}`
+ *
+ * The description is the task summary one-liner if available (it describes
+ * what was actually built), falling back to the task title (what was planned).
+ */
+export function buildTaskCommitMessage(ctx) {
+    const scope = ctx.taskId; // e.g. "S01/T02" or just "T02"
+    const description = ctx.oneLiner || ctx.taskTitle;
+    const type = inferCommitType(ctx.taskTitle, ctx.oneLiner);
+    // Truncate description to ~72 chars for subject line
+    const maxDescLen = 68 - type.length - scope.length;
+    const truncated = description.length > maxDescLen
+        ? description.slice(0, maxDescLen - 1).trimEnd() + "…"
+        : description;
+    const subject = `${type}(${scope}): ${truncated}`;
+    // Build body with key files if available
+    if (ctx.keyFiles && ctx.keyFiles.length > 0) {
+        const fileLines = ctx.keyFiles
+            .slice(0, 8) // cap at 8 files to keep commit concise
+            .map(f => `- ${f}`)
+            .join("\n");
+        return `${subject}\n\n${fileLines}`;
+    }
+    return subject;
+}
+/**
+ * Thrown when a slice merge hits code conflicts in non-.gsd files.
+ * The working tree is left in a conflicted state (no reset) so the
+ * caller can dispatch a fix-merge session to resolve it.
+ */
+export class MergeConflictError extends GSDError {
+    conflictedFiles;
+    strategy;
+    branch;
+    mainBranch;
+    constructor(conflictedFiles, strategy, branch, mainBranch) {
+        super(GSD_MERGE_CONFLICT, `${strategy === "merge" ? "Merge" : "Squash-merge"} of "${branch}" into "${mainBranch}" ` +
+            `failed with conflicts in ${conflictedFiles.length} non-.gsd file(s): ${conflictedFiles.join(", ")}`);
+        this.name = "MergeConflictError";
+        this.conflictedFiles = conflictedFiles;
+        this.strategy = strategy;
+        this.branch = branch;
+        this.mainBranch = mainBranch;
+    }
+}
+// ─── Constants ─────────────────────────────────────────────────────────────
+/**
+ * GSD runtime paths that should be excluded from smart staging.
+ * These are transient/generated artifacts that should never be committed.
+ * Matches the union of SKIP_PATHS + SKIP_EXACT in worktree-manager.ts
+ * and the first 7 entries in gitignore.ts BASELINE_PATTERNS.
+ */
+export const RUNTIME_EXCLUSION_PATHS = [
+    ".gsd/activity/",
+    ".gsd/runtime/",
+    ".gsd/worktrees/",
+    ".gsd/auto.lock",
+    ".gsd/metrics.json",
+    ".gsd/completed-units.json",
+    ".gsd/STATE.md",
+    ".gsd/gsd.db",
+    ".gsd/DISCUSSION-MANIFEST.json",
+];
+// ─── Integration Branch Metadata ───────────────────────────────────────────
+/**
+ * Path to the milestone metadata file that stores the integration branch.
+ * Format: .gsd/milestones/<MID>/<MID>-META.json
+ */
+function milestoneMetaPath(basePath, milestoneId) {
+    return join(gsdRoot(basePath), "milestones", milestoneId, `${milestoneId}-META.json`);
+}
+/**
+ * Read the integration branch recorded for a milestone.
+ * Returns null if no metadata file exists or the branch isn't set.
+ */
+export function readIntegrationBranch(basePath, milestoneId) {
+    try {
+        const metaFile = milestoneMetaPath(basePath, milestoneId);
+        if (!existsSync(metaFile))
+            return null;
+        const data = JSON.parse(readFileSync(metaFile, "utf-8"));
+        const branch = data?.integrationBranch;
+        if (typeof branch === "string" && branch.trim() !== "" && VALID_BRANCH_NAME.test(branch)) {
+            return branch;
+        }
+        return null;
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Persist the integration branch for a milestone.
+ *
+ * Called when auto-mode starts on a milestone. Records the branch the user
+ * was on at that point, so the milestone worktree merges back to the correct
+ * branch. Idempotent when the branch matches; updates the record when the
+ * user starts from a different branch.
+ *
+ * The file is committed immediately so the metadata is persisted in git.
+ */
+/** Regex matching GSD quick-task branches: gsd/quick/<num>-<slug> */
+export const QUICK_BRANCH_RE = /^gsd\/quick\//;
+export function writeIntegrationBranch(basePath, milestoneId, branch) {
+    // Don't record slice branches as the integration target
+    if (SLICE_BRANCH_RE.test(branch))
+        return;
+    // Don't record quick-task branches — they are ephemeral and merge back
+    // to their origin branch on completion. Recording one as the integration
+    // target causes milestone merges to land on the wrong branch (#1293).
+    if (QUICK_BRANCH_RE.test(branch))
+        return;
+    // Validate
+    if (!VALID_BRANCH_NAME.test(branch))
+        return;
+    // Skip if already recorded with the same branch (idempotent across restarts).
+    // If recorded with a different branch, update it — the user started auto-mode
+    // from a new branch and expects slices to merge back there (#300).
+    const existingBranch = readIntegrationBranch(basePath, milestoneId);
+    if (existingBranch === branch)
+        return;
+    const metaFile = milestoneMetaPath(basePath, milestoneId);
+    mkdirSync(join(gsdRoot(basePath), "milestones", milestoneId), { recursive: true });
+    // Merge with existing metadata if present
+    let existing = {};
+    try {
+        if (existsSync(metaFile)) {
+            existing = JSON.parse(readFileSync(metaFile, "utf-8"));
+        }
+    }
+    catch { /* corrupt file — overwrite */ }
+    existing.integrationBranch = branch;
+    writeFileSync(metaFile, JSON.stringify(existing, null, 2) + "\n", "utf-8");
+    // .gsd/ is managed externally (symlinked) — metadata is not committed to git.
+}
+// ─── Git Helper ────────────────────────────────────────────────────────────
+/**
+ * Strip git-svn noise from error messages.
+ * Some systems (notably Arch Linux) have a buggy git-svn Perl module that
+ * emits warnings on every git invocation, confusing users. See #404.
+ */
+function filterGitSvnNoise(message) {
+    return message
+        .replace(/Duplicate specification "[^"]*" for option "[^"]*"\n?/g, "")
+        .replace(/Unable to determine upstream SVN information from .*\n?/g, "")
+        .replace(/Perhaps the repository is empty\. at .*git-svn.*\n?/g, "")
+        .trim();
+}
+/**
+ * Run a git command in the given directory.
+ * Returns trimmed stdout. Throws on non-zero exit unless allowFailure is set.
+ * When `input` is provided, it is piped to stdin.
+ */
+export function runGit(basePath, args, options = {}) {
+    try {
+        return execFileSync("git", args, {
+            cwd: basePath,
+            stdio: [options.input != null ? "pipe" : "ignore", "pipe", "pipe"],
+            encoding: "utf-8",
+            env: GIT_NO_PROMPT_ENV,
+            ...(options.input != null ? { input: options.input } : {}),
+        }).trim();
+    }
+    catch (error) {
+        if (options.allowFailure)
+            return "";
+        const message = getErrorMessage(error);
+        throw new GSDError(GSD_GIT_ERROR, `git ${args.join(" ")} failed in ${basePath}: ${filterGitSvnNoise(message)}`);
+    }
+}
+// ─── Commit Type Inference ─────────────────────────────────────────────────
+/**
+ * Keyword-to-commit-type mapping. Order matters — first match wins.
+ * Each entry: [keywords[], commitType]
+ */
+const COMMIT_TYPE_RULES = [
+    [["fix", "fixed", "fixes", "bug", "patch", "hotfix", "repair", "correct"], "fix"],
+    [["refactor", "restructure", "reorganize"], "refactor"],
+    [["doc", "docs", "documentation", "readme", "changelog"], "docs"],
+    [["test", "tests", "testing", "spec", "coverage"], "test"],
+    [["perf", "performance", "optimize", "speed", "cache"], "perf"],
+    [["chore", "cleanup", "clean up", "dependencies", "deps", "bump", "config", "ci", "archive", "remove", "delete"], "chore"],
+];
+// ─── GitServiceImpl ────────────────────────────────────────────────────
+export class GitServiceImpl {
+    basePath;
+    prefs;
+    /** Active milestone ID — used to resolve the integration branch. */
+    _milestoneId = null;
+    constructor(basePath, prefs = {}) {
+        this.basePath = basePath;
+        this.prefs = prefs;
+    }
+    /**
+     * Set the active milestone ID for integration branch resolution.
+     * When set, getMainBranch() will check the milestone's metadata file
+     * for a recorded integration branch before falling back to repo defaults.
+     */
+    setMilestoneId(milestoneId) {
+        this._milestoneId = milestoneId;
+    }
+    /** Convenience wrapper: run git in this repo's basePath. */
+    git(args, options = {}) {
+        return runGit(this.basePath, args, options);
+    }
+    /**
+     * Smart staging: `git add -A` excluding GSD runtime paths via pathspec.
+     * Falls back to plain `git add -A` if the exclusion pathspec fails.
+     * @param extraExclusions Additional pathspec exclusions beyond RUNTIME_EXCLUSION_PATHS.
+     */
+    smartStage(extraExclusions = []) {
+        // One-time cleanup: if runtime files are already tracked in the index
+        // (from older versions where the fallback bug staged them), untrack them
+        // in a dedicated commit. This must happen as a separate commit because
+        // the git reset HEAD step below would otherwise undo the rm --cached.
+        //
+        // SAFETY: Only untrack the specific RUNTIME paths (activity/, runtime/,
+        // auto.lock, etc.) — NOT all of .gsd/. If .gsd/milestones/ files were
+        // previously tracked, they stay tracked until the milestone completes
+        // and the worktree is torn down. This prevents a mid-execution behavioral
+        // discontinuity where the first half of a milestone has .gsd/ artifacts
+        // committed but the second half doesn't (#1326).
+        if (!this._runtimeFilesCleanedUp) {
+            let cleaned = false;
+            for (const exclusion of RUNTIME_EXCLUSION_PATHS) {
+                const removed = nativeRmCached(this.basePath, [exclusion]);
+                if (removed.length > 0)
+                    cleaned = true;
+            }
+            if (cleaned) {
+                nativeCommit(this.basePath, "chore: untrack .gsd/ runtime files from git index", { allowEmpty: false });
+            }
+            this._runtimeFilesCleanedUp = true;
+        }
+        // Stage everything, then unstage excluded paths.
+        //
+        // Exclude only RUNTIME paths from staging — not the entire .gsd/ directory.
+        // When .gsd/milestones/ files are already tracked in the index (projects
+        // where .gsd/ is not gitignored, or Windows junctions that git sees as
+        // real directories), they should continue to be committed. Excluding the
+        // entire .gsd/ directory mid-milestone causes silent commit failure where
+        // the second half of a milestone's artifacts are never committed (#1326).
+        //
+        // If .gsd/ IS in .gitignore (the default for external state projects),
+        // git add -A already skips it and the reset is a harmless no-op.
+        nativeAddAll(this.basePath);
+        const runtimeExclusions = [...RUNTIME_EXCLUSION_PATHS, ...extraExclusions];
+        for (const exclusion of runtimeExclusions) {
+            try {
+                nativeResetPaths(this.basePath, [exclusion]);
+            }
+            catch { /* path not staged — ignore */ }
+        }
+    }
+    /** Tracks whether runtime file cleanup has run this session. */
+    _runtimeFilesCleanedUp = false;
+    /**
+     * Stage files (smart staging) and commit.
+     * Returns the commit message string on success, or null if nothing to commit.
+     * Uses `git commit -F -` with stdin pipe for safe multi-line message handling.
+     */
+    commit(opts) {
+        this.smartStage();
+        // Check if anything was actually staged
+        if (!nativeHasStagedChanges(this.basePath) && !opts.allowEmpty)
+            return null;
+        nativeCommit(this.basePath, opts.message, { allowEmpty: opts.allowEmpty ?? false });
+        return opts.message;
+    }
+    /**
+     * Auto-commit dirty working tree.
+     *
+     * When `taskContext` is provided, generates a meaningful conventional commit
+     * message from the task execution results (one-liner, title, inferred type).
+     * Falls back to a generic `chore()` message when no context is available
+     * (e.g. pre-switch commits, stop commits, state rebuild commits).
+     *
+     * Returns the commit message on success, or null if nothing to commit.
+     * @param extraExclusions Additional paths to exclude from staging (e.g. [".gsd/"] for pre-switch commits).
+     */
+    autoCommit(unitType, unitId, extraExclusions = [], taskContext) {
+        // Quick check: is there anything dirty at all?
+        // Native path uses libgit2 (single syscall), fallback spawns git.
+        if (!nativeHasChanges(this.basePath))
+            return null;
+        this.smartStage(extraExclusions);
+        // After smart staging, check if anything was actually staged
+        // (all changes might have been runtime files that got excluded)
+        if (!nativeHasStagedChanges(this.basePath))
+            return null;
+        const message = taskContext
+            ? buildTaskCommitMessage(taskContext)
+            : `chore(${unitId}): auto-commit after ${unitType}`;
+        nativeCommit(this.basePath, message, { allowEmpty: false });
+        return message;
+    }
+    // ─── Branch Queries ────────────────────────────────────────────────────
+    /**
+     * Get the integration branch for this repo — the branch that slice
+     * branches are created from and merged back into.
+     *
+     * This is often `main` or `master`, but not necessarily. When a user
+     * starts GSD on a feature branch like `f-123-new-thing`, that branch
+     * is recorded as the integration target, and all slice branches merge
+     * back into it — not the repo's default branch. The name "main branch"
+     * in variable names is historical; think of it as "integration branch".
+     *
+     * Resolution order:
+     * 1. Explicit `main_branch` preference (user override, highest priority)
+     * 2. Milestone integration branch from metadata file (recorded at milestone start)
+     * 3. Worktree base branch (worktree/<name>)
+     * 4. origin/HEAD symbolic-ref → main/master fallback → current branch
+     */
+    getMainBranch() {
+        // Explicit preference takes priority (double-check validity as defense-in-depth)
+        if (this.prefs.main_branch && VALID_BRANCH_NAME.test(this.prefs.main_branch)) {
+            return this.prefs.main_branch;
+        }
+        // Check milestone integration branch — recorded when auto-mode starts
+        if (this._milestoneId) {
+            const integrationBranch = readIntegrationBranch(this.basePath, this._milestoneId);
+            if (integrationBranch) {
+                // Verify the branch still exists locally (could have been deleted)
+                if (nativeBranchExists(this.basePath, integrationBranch))
+                    return integrationBranch;
+            }
+        }
+        const wtName = detectWorktreeName(this.basePath);
+        if (wtName) {
+            const wtBranch = `worktree/${wtName}`;
+            if (nativeBranchExists(this.basePath, wtBranch))
+                return wtBranch;
+            return nativeGetCurrentBranch(this.basePath);
+        }
+        // Repo-level default detection: origin/HEAD → main → master → current branch.
+        // Native path uses libgit2 (single call), fallback spawns multiple git processes.
+        return nativeDetectMainBranch(this.basePath);
+    }
+    /** Get the current branch name. Native libgit2 when available, execSync fallback. */
+    getCurrentBranch() {
+        return nativeGetCurrentBranch(this.basePath);
+    }
+    /** True if currently on a GSD slice branch. */
+    // ─── Branch Lifecycle ──────────────────────────────────────────────────
+    // ─── S05 Features ─────────────────────────────────────────────────────
+    /**
+     * Create a snapshot ref for the given label (typically a slice branch name).
+     * Gated on prefs.snapshots === true. Ref path: refs/gsd/snapshots/<label>/<timestamp>
+     * The ref points at HEAD, capturing the current commit before destructive operations.
+     */
+    createSnapshot(label) {
+        if (this.prefs.snapshots !== true)
+            return;
+        const now = new Date();
+        const ts = now.getFullYear().toString()
+            + String(now.getMonth() + 1).padStart(2, "0")
+            + String(now.getDate()).padStart(2, "0")
+            + "-"
+            + String(now.getHours()).padStart(2, "0")
+            + String(now.getMinutes()).padStart(2, "0")
+            + String(now.getSeconds()).padStart(2, "0");
+        const refPath = `refs/gsd/snapshots/${label}/${ts}`;
+        nativeUpdateRef(this.basePath, refPath, "HEAD");
+    }
+    /**
+     * Run pre-merge verification check. Auto-detects test runner from project
+     * files, or uses custom command from prefs.pre_merge_check.
+     * Gated on prefs.pre_merge_check (false = skip, string = custom command).
+     * Stub: to be implemented in T03.
+     */
+    runPreMergeCheck() {
+        if (this.prefs.pre_merge_check === false || this.prefs.pre_merge_check === undefined) {
+            return { passed: true, skipped: true };
+        }
+        // Determine command: explicit string or auto-detect from package.json
+        let command;
+        if (typeof this.prefs.pre_merge_check === "string") {
+            command = this.prefs.pre_merge_check;
+        }
+        else {
+            // Auto-detect: look for package.json with a test script
+            try {
+                const pkg = readFileSync(join(this.basePath, "package.json"), "utf-8");
+                const parsed = JSON.parse(pkg);
+                if (parsed.scripts?.test) {
+                    command = "npm test";
+                }
+                else {
+                    return { passed: true, skipped: true };
+                }
+            }
+            catch {
+                return { passed: true, skipped: true };
+            }
+        }
+        try {
+            execSync(command, { cwd: this.basePath, stdio: "pipe", encoding: "utf-8" });
+            return { passed: true, skipped: false, command };
+        }
+        catch (err) {
+            const msg = getErrorMessage(err);
+            return { passed: false, skipped: false, command, error: msg };
+        }
+    }
+}
+// ─── Factory ───────────────────────────────────────────────────────────────
+/** Create a GitServiceImpl with the current effective git preferences. */
+export function createGitService(basePath) {
+    const gitPrefs = loadEffectiveGSDPreferences()?.preferences?.git ?? {};
+    return new GitServiceImpl(basePath, gitPrefs);
+}
+// ─── Commit Type Inference ─────────────────────────────────────────────────
+/**
+ * Infer a conventional commit type from a title (and optional one-liner).
+ * Uses case-insensitive word-boundary matching against known keywords.
+ * Returns "feat" when no keywords match.
+ *
+ * Used for both slice squash-merge titles and task commit messages.
+ */
+export function inferCommitType(title, oneLiner) {
+    const lower = `${title} ${oneLiner || ""}`.toLowerCase();
+    for (const [keywords, commitType] of COMMIT_TYPE_RULES) {
+        for (const keyword of keywords) {
+            // "clean up" is multi-word — use indexOf for it
+            if (keyword.includes(" ")) {
+                if (lower.includes(keyword))
+                    return commitType;
+            }
+            else {
+                // Word boundary match: keyword must not be surrounded by word chars
+                const re = new RegExp(`\\b${keyword}\\b`, "i");
+                if (re.test(lower))
+                    return commitType;
+            }
+        }
+    }
+    return "feat";
+}

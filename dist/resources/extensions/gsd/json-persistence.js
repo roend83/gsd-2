@@ -1,0 +1,62 @@
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
+import { dirname } from "node:path";
+/**
+ * Load a JSON file with validation, returning a default on failure.
+ * Handles missing files, corrupt JSON, and schema mismatches uniformly.
+ */
+export function loadJsonFile(filePath, validate, defaultFactory) {
+    try {
+        if (!existsSync(filePath))
+            return defaultFactory();
+        const raw = readFileSync(filePath, "utf-8");
+        const parsed = JSON.parse(raw);
+        return validate(parsed) ? parsed : defaultFactory();
+    }
+    catch {
+        return defaultFactory();
+    }
+}
+/**
+ * Load a JSON file with validation, returning null on failure.
+ * For callers that distinguish "no data" from "default data".
+ */
+export function loadJsonFileOrNull(filePath, validate) {
+    try {
+        if (!existsSync(filePath))
+            return null;
+        const raw = readFileSync(filePath, "utf-8");
+        const parsed = JSON.parse(raw);
+        return validate(parsed) ? parsed : null;
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Save a JSON file, creating parent directories as needed.
+ * Non-fatal — swallows errors to prevent persistence from breaking operations.
+ */
+export function saveJsonFile(filePath, data) {
+    try {
+        mkdirSync(dirname(filePath), { recursive: true });
+        writeFileSync(filePath, JSON.stringify(data, null, 2) + "\n", "utf-8");
+    }
+    catch {
+        // Non-fatal — don't let persistence failures break operation
+    }
+}
+/**
+ * Write a JSON file atomically (write to .tmp, then rename).
+ * Creates parent directories as needed. Non-fatal on error.
+ */
+export function writeJsonFileAtomic(filePath, data) {
+    try {
+        mkdirSync(dirname(filePath), { recursive: true });
+        const tmp = filePath + ".tmp";
+        writeFileSync(tmp, JSON.stringify(data, null, 2), "utf-8");
+        renameSync(tmp, filePath);
+    }
+    catch {
+        // Non-fatal — don't let persistence failures break operation
+    }
+}

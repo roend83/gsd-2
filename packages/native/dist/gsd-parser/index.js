@@ -1,0 +1,54 @@
+/**
+ * GSD file parser — native Rust implementation.
+ *
+ * Parses `.gsd/` directory markdown files containing YAML-like frontmatter
+ * and structured sections. Replaces the JS regex-based parser for
+ * performance-critical batch operations.
+ */
+import { native } from "../native.js";
+/**
+ * Parse YAML-like frontmatter from markdown content.
+ *
+ * Returns `{ metadata, body }` where `metadata` is a JSON string
+ * of the parsed frontmatter key-value pairs. Parse it with `JSON.parse()`.
+ */
+export function parseFrontmatter(content) {
+    return native.parseFrontmatter(content);
+}
+/**
+ * Extract a section from markdown content by heading name.
+ *
+ * @param content  Markdown content to search.
+ * @param heading  Heading text to match (without the `#` prefix).
+ * @param level    Heading level (default 2 for `##`).
+ */
+export function extractSection(content, heading, level) {
+    return native.extractSection(content, heading, level);
+}
+/**
+ * Extract all sections at a given heading level.
+ *
+ * Returns a JSON string mapping heading names to their content.
+ * Parse with `JSON.parse()`.
+ */
+export function extractAllSections(content, level) {
+    return native.extractAllSections(content, level);
+}
+/**
+ * Batch-parse all `.md` files in a `.gsd/` directory tree.
+ *
+ * Reads and parses all markdown files under the given directory.
+ * Each file gets frontmatter parsing and section extraction.
+ */
+export function batchParseGsdFiles(directory) {
+    return native.batchParseGsdFiles(directory);
+}
+/**
+ * Parse a roadmap file's content into structured data.
+ *
+ * Extracts title, vision, success criteria, slices (with risk/depends),
+ * and boundary map entries.
+ */
+export function parseRoadmapFile(content) {
+    return native.parseRoadmapFile(content);
+}

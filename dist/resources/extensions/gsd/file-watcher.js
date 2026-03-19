@@ -1,0 +1,76 @@
+import { relative } from "node:path";
+let watcher = null;
+const EVENT_MAP = {
+    "settings.json": "settings-changed",
+    "auth.json": "auth-changed",
+    "models.json": "models-changed",
+};
+const EXTENSIONS_DIR = "extensions";
+const IGNORED_PATTERNS = [
+    "**/sessions/**",
+    "**/*.tmp",
+    "**/*.swp",
+    "**/*~",
+    "**/.DS_Store",
+];
+const DEBOUNCE_MS = 300;
+/**
+ * Start watching `agentDir` (e.g. `~/.gsd/agent/`) for config changes.
+ * Emits events on the supplied EventBus when watched files are modified.
+ */
+export async function startFileWatcher(agentDir, eventBus) {
+    if (watcher) {
+        await watcher.close();
+    }
+    const { watch } = await import("chokidar");
+    const pending = new Map();
+    function debounceEmit(event) {
+        const existing = pending.get(event);
+        if (existing)
+            clearTimeout(existing);
+        pending.set(event, setTimeout(() => {
+            pending.delete(event);
+            eventBus.emit(event, { timestamp: Date.now() });
+        }, DEBOUNCE_MS));
+    }
+    function resolveEvent(filePath) {
+        const rel = relative(agentDir, filePath);
+        if (rel.startsWith(".."))
+            return null;
+        // Check direct file matches
+        for (const [file, event] of Object.entries(EVENT_MAP)) {
+            if (rel === file)
+                return event;
+        }
+        // Check extensions directory
+        if (rel.startsWith(EXTENSIONS_DIR + "/") || rel === EXTENSIONS_DIR) {
+            return "extensions-changed";
+        }
+        return null;
+    }
+    watcher = watch(agentDir, {
+        ignoreInitial: true,
+        depth: 2,
+        ignored: IGNORED_PATTERNS,
+    });
+    for (const eventType of ["add", "change", "unlink"]) {
+        watcher.on(eventType, (filePath) => {
+            const event = resolveEvent(filePath);
+            if (event)
+                debounceEmit(event);
+        });
+    }
+    // Wait for watcher to be ready
+    await new Promise((resolve) => {
+        watcher.on("ready", resolve);
+    });
+}
+/**
+ * Stop the file watcher and clean up resources.
+ */
+export async function stopFileWatcher() {
+    if (watcher) {
+        await watcher.close();
+        watcher = null;
+    }
+}
