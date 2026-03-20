@@ -30,8 +30,8 @@
     "README.md"
   ],
   "piConfig": {
-    "name": "gsd",
-    "configDir": ".gsd"
+    "name": "gsd-vertex",
+    "configDir": ".gsd-vertex"
   },
   "engines": {
     "node": ">=22.0.0"
